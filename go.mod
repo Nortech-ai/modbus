@@ -1,4 +1,4 @@
-module github.com/pierreyves258/modbus
+module github.com/Nortech-ai/modbus
 
 go 1.18
 
