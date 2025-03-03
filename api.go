@@ -29,6 +29,16 @@ type Client interface {
 	// holding registers in a remote device and returns register value.
 	ReadHoldingRegisters(address, quantity uint16) (results []byte, err error)
 
+	// Function code 17: Report Slave ID
+	//
+	// Returns a description of the type of controller present at the slave address,
+	// the current status of the slave RUN indicator, and other information specific
+	// to the slave device.
+	//
+	// Broadcast is not supported. The data contents are specific to each type of controller.
+	ReportSlaveId() (results ReportSlaveId, err error)
+
+	// Function code 43: Read Device Identification
 	ReadDeviceIdentification(devIdCode byte, objectId byte) (results []byte, err error)
 	GetDeviceIdentification(devIdCode byte, objectId byte) (results DeviceIdentification, err error)
 

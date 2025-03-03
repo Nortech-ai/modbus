@@ -34,6 +34,9 @@ const (
 	RegularDeviceIdentification  = 2
 	ExtendedDeviceIdentification = 3
 	SingleDeviceIdentification   = 4
+
+	// Report Slave ID
+	FuncCodeReportSlaveId = 0x11
 )
 
 const (

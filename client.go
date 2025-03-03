@@ -242,6 +242,53 @@ func (mb *client) ReadInputRegisters(address, quantity uint16) (results []byte, 
 
 // Request:
 //
+//	Function code         : 1 byte (0x11)
+//
+// Response:
+//
+//	Function code         : 1 byte (0x11)
+//	Byte count            : 1 byte
+//	Slave ID              : 1 byte
+//	Run indicator         : 1 byte
+//	Other information     : N bytes
+func (mb *client) ReportSlaveId() (results ReportSlaveId, err error) {
+	request := ProtocolDataUnit{
+		FunctionCode: FuncCodeReportSlaveId,
+		Data:         []byte{},
+	}
+
+	aduRequest, err := mb.packager.Encode(&request)
+	if err != nil {
+		return
+	}
+
+	aduResponse, err := mb.transporter.Send(aduRequest)
+	if err != nil {
+		return
+	}
+
+	length := len(aduResponse)
+	if length < 4 {
+		return ReportSlaveId{}, &ModbusPDUError{
+			ExceptionCode: ExceptionCodePDUWrongDevIDResponse,
+			Request:       length,
+		}
+	}
+
+	reportSlaveId, err := ParseReportSlaveId(aduResponse)
+	if err != nil {
+		return ReportSlaveId{}, &ModbusPDUError{
+			ExceptionCode: ExceptionCodePDUWrongDevIDResponse,
+			Request:       length,
+		}
+	}
+
+	results = reportSlaveId
+	return
+}
+
+// Request:
+//
 //	Device ID Code		  : 1 byte
 //	Object ID		      : 1 byte
 //
