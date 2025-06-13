@@ -6,6 +6,7 @@ package modbus
 
 import (
 	"io"
+	"strings"
 	"time"
 )
 
@@ -71,6 +72,12 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 	//or the error package, depending on the error status (byte 2 of the response)
 	n, err = io.ReadAtLeast(mb.conn, data[:], rtuMinSize)
 	if err != nil {
+		// If there is a valid connection; and the error is a timeout;
+		// then close the connection to force a reconnect on the next request
+		if strings.Contains(err.Error(), "i/o timeout") && mb.conn != nil {
+			mb.conn.Close()
+			mb.conn = nil
+		}
 		return
 	}
 	//if the function is correct
