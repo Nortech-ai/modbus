@@ -49,7 +49,7 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 	// Set write and read timeout
 	var timeout time.Time
 	if mb.Timeout > 0 {
-		timeout = mb.lastActivity.Add(mb.Timeout)
+		timeout = mb.tcpTransporter.lastActivity.Add(mb.Timeout)
 	}
 	if err = mb.conn.SetDeadline(timeout); err != nil {
 		return
