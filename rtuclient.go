@@ -45,10 +45,11 @@ type rtuPackager struct {
 }
 
 // Encode encodes PDU in a RTU frame:
-//  Slave Address   : 1 byte
-//  Function        : 1 byte
-//  Data            : 0 up to 252 bytes
-//  CRC             : 2 byte
+//
+//	Slave Address   : 1 byte
+//	Function        : 1 byte
+//	Data            : 0 up to 252 bytes
+//	CRC             : 2 byte
 func (mb *rtuPackager) Encode(pdu *ProtocolDataUnit) (adu []byte, err error) {
 	length := len(pdu.Data) + 4
 	if length > rtuMaxSize {
@@ -103,6 +104,99 @@ func (mb *rtuPackager) Decode(adu []byte) (pdu *ProtocolDataUnit, err error) {
 	pdu.FunctionCode = adu[1]
 	pdu.Data = adu[2 : length-2]
 	return
+}
+
+func (mb *rtuPackager) TryDecode(buffer *[]byte, frame *[]byte) {
+
+	// Check if we have enough data for a complete frame
+	frameLength := mb.findFrameInBuffer(*buffer)
+	if frameLength == 0 {
+		// Not enough data for a complete frame
+		return
+	}
+
+	if len(*buffer) < frameLength {
+		// Not enough data for complete frame
+		return
+	}
+
+	// Extract complete frame
+	*frame = (*buffer)[:frameLength]
+	*buffer = (*buffer)[frameLength:]
+}
+
+func (mb *rtuPackager) findFrameInBuffer(data []byte) int {
+	if len(data) < 2 {
+		return 0
+	}
+	// For RTU over TCP, the frame structure is:
+	// [Slave ID][Function Code][Data...][CRC Low][CRC High]
+
+	_ = data[0] // slaveID
+	functionCode := data[1]
+
+	// Calculate expected frame length based on function code
+	var expectedLength int
+
+	switch functionCode {
+	case 0x01, 0x02, 0x03, 0x04, 0x05, 0x06:
+		// Read/Write single register/coil functions
+		// [Slave ID][Function Code][Address High][Address Low][Value High][Value Low][CRC Low][CRC High]
+		expectedLength = 8
+	case 0x0F, 0x10:
+		// Write multiple registers/coils
+		// [Slave ID][Function Code][Address High][Address Low][Quantity High][Quantity Low][Byte Count][Data...][CRC Low][CRC High]
+		if len(data) < 6 {
+			return 0 // Need at least 6 bytes to determine length
+		}
+		byteCount := int(data[6])
+		expectedLength = 9 + byteCount // 7 header bytes + data + 2 CRC bytes
+	case 0x17:
+		// Read/Write Multiple Registers
+		// [Slave ID][Function Code][Read Address High][Read Address Low][Read Quantity High][Read Quantity Low][Write Address High][Write Address Low][Write Quantity High][Write Quantity Low][Write Byte Count][Write Data...][CRC Low][CRC High]
+		if len(data) < 12 {
+			return 0 // Need at least 12 bytes to determine length
+		}
+		writeByteCount := int(data[11])
+		expectedLength = 13 + writeByteCount // 12 header bytes + data + 2 CRC bytes
+	default:
+		// For unknown function codes, try to find frame boundary by looking for valid CRC
+		// This is a fallback method
+		return mb.findFrameByCRC(data)
+	}
+
+	// Check if we have enough data for the expected frame length
+	if len(data) >= expectedLength {
+		return expectedLength
+	}
+
+	return 0 // Not enough data for complete frame
+}
+
+func (mb *rtuPackager) findFrameByCRC(data []byte) int {
+	// Try to find frame boundary by validating CRC
+	// This is a fallback for unknown function codes
+	for i := 4; i <= len(data)-2; i++ {
+		if mb.validateCRC(data[:i+2]) {
+			return i + 2
+		}
+	}
+	return 0
+}
+
+func (mb *rtuPackager) validateCRC(data []byte) bool {
+	if len(data) < 3 {
+		return false
+	}
+
+	// Extract CRC from last 2 bytes
+	crcReceived := uint16(data[len(data)-2]) | (uint16(data[len(data)-1]) << 8)
+
+	// Calculate CRC for data without the CRC bytes
+	var crc crc
+	crc.reset().pushBytes(data[:len(data)-2])
+	return crcReceived == crc.value()
+
 }
 
 // rtuSerialTransporter implements Transporter interface.
