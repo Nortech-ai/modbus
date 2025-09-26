@@ -94,12 +94,13 @@ type tcpPackager struct {
 }
 
 // Encode adds modbus application protocol header:
-//  Transaction identifier: 2 bytes
-//  Protocol identifier: 2 bytes
-//  Length: 2 bytes
-//  Unit identifier: 1 byte
-//  Function code: 1 byte
-//  Data: n bytes
+//
+//	Transaction identifier: 2 bytes
+//	Protocol identifier: 2 bytes
+//	Length: 2 bytes
+//	Unit identifier: 1 byte
+//	Function code: 1 byte
+//	Data: n bytes
 func (mb *tcpPackager) Encode(pdu *ProtocolDataUnit) (adu []byte, err error) {
 	adu = make([]byte, tcpHeaderSize+1+len(pdu.Data))
 
@@ -154,10 +155,11 @@ func (mb *tcpPackager) Verify(aduRequest []byte, aduResponse []byte) (err error)
 }
 
 // Decode extracts PDU from TCP frame:
-//  Transaction identifier: 2 bytes
-//  Protocol identifier: 2 bytes
-//  Length: 2 bytes
-//  Unit identifier: 1 byte
+//
+//	Transaction identifier: 2 bytes
+//	Protocol identifier: 2 bytes
+//	Length: 2 bytes
+//	Unit identifier: 1 byte
 func (mb *tcpPackager) Decode(adu []byte) (pdu *ProtocolDataUnit, err error) {
 	// Read length value in the header
 	length := binary.BigEndian.Uint16(adu[4:])
