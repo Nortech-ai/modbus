@@ -205,25 +205,25 @@ func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error
 	if err = mb.connect(); err != nil {
 		return
 	}
-	// Set timer to close when idle
-	mb.lastActivity = time.Now()
-	mb.startCloseTimer()
 	// Set write and read timeout
 	var timeout time.Time
 	if mb.Timeout > 0 {
-		timeout = mb.lastActivity.Add(mb.Timeout)
+		timeout = time.Now().Add(mb.Timeout)
 	}
 	if err = mb.conn.SetDeadline(timeout); err != nil {
+		mb.close() // Close broken connection
 		return
 	}
 	// Send data
 	mb.logf("modbus: sending % x", aduRequest)
 	if _, err = mb.conn.Write(aduRequest); err != nil {
+		mb.close() // Close broken connection
 		return
 	}
 	// Read header first
 	var data [tcpMaxLength]byte
 	if _, err = io.ReadFull(mb.conn, data[:tcpHeaderSize]); err != nil {
+		mb.close() // Close broken connection
 		return
 	}
 	// Read length, ignore transaction & protocol id (4 bytes)
@@ -246,10 +246,14 @@ func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error
 	// Skip unit id
 	length += tcpHeaderSize - 1
 	if _, err = io.ReadFull(mb.conn, data[tcpHeaderSize:length]); err != nil {
+		mb.close() // Close broken connection
 		return
 	}
 	aduResponse = data[:length]
 	mb.logf("modbus: received % x\n", aduResponse)
+	// Update last activity after successful operation
+	mb.lastActivity = time.Now()
+	mb.startCloseTimer()
 	return
 }
 
@@ -263,14 +267,33 @@ func (mb *tcpTransporter) Connect() error {
 }
 
 func (mb *tcpTransporter) connect() error {
-	if mb.conn == nil {
-		dialer := net.Dialer{Timeout: mb.Timeout}
-		conn, err := dialer.Dial("tcp", mb.Address)
-		if err != nil {
-			return err
-		}
-		mb.conn = conn
+	if mb.conn != nil {
+		return nil
 	}
+
+	// Store connection parameters before releasing mutex
+	address := mb.Address
+	timeout := mb.Timeout
+
+	// Release mutex during dial to avoid blocking other operations
+	// This allows other goroutines to check connection status
+	mb.mu.Unlock()
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.Dial("tcp", address)
+	mb.mu.Lock()
+
+	// Check again if connection was established by another goroutine while we were dialing
+	if mb.conn != nil {
+		if conn != nil {
+			conn.Close() // Close the connection we just created, use the existing one
+		}
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+	mb.conn = conn
 	return nil
 }
 
@@ -317,6 +340,11 @@ func (mb *tcpTransporter) logf(format string, v ...interface{}) {
 
 // closeLocked closes current connection. Caller must hold the mutex before calling this method.
 func (mb *tcpTransporter) close() (err error) {
+	// Stop the idle timeout timer
+	if mb.closeTimer != nil {
+		mb.closeTimer.Stop()
+		mb.closeTimer = nil
+	}
 	if mb.conn != nil {
 		err = mb.conn.Close()
 		mb.conn = nil
@@ -332,7 +360,7 @@ func (mb *tcpTransporter) closeIdle() {
 	if mb.IdleTimeout <= 0 {
 		return
 	}
-	idle := time.Now().Sub(mb.lastActivity)
+	idle := time.Since(mb.lastActivity)
 	if idle >= mb.IdleTimeout {
 		mb.logf("modbus: closing connection due to idle timeout: %v", idle)
 		mb.close()
