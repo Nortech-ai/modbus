@@ -699,19 +699,21 @@ func (mb *client) ReadFIFOQueue(address uint16) (results []byte, err error) {
 			Response:      4,
 		}
 	}
-	count := int(binary.BigEndian.Uint16(response.Data))
-	if count != (len(response.Data) - 1) {
+	byteCount := int(binary.BigEndian.Uint16(response.Data))
+	// Byte count field indicates number of bytes following it (including FIFO count)
+	// So total length should be: 2 (byte count field) + byteCount
+	if byteCount != (len(response.Data) - 2) {
 		return []byte{}, &ModbusPDUError{
 			ExceptionCode: ExceptionCodePDUWrongResponseDataSize,
-			Request:       len(response.Data) - 1,
-			Response:      count,
+			Request:       len(response.Data) - 2,
+			Response:      byteCount,
 		}
 	}
-	count = int(binary.BigEndian.Uint16(response.Data[2:]))
-	if count > 31 {
+	fifoCount := int(binary.BigEndian.Uint16(response.Data[2:]))
+	if fifoCount > 31 {
 		return []byte{}, &ModbusPDUError{
 			ExceptionCode: ExceptionCodePDUFifoGreater,
-			Request:       count,
+			Request:       fifoCount,
 			Response:      31,
 		}
 	}

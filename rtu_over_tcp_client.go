@@ -49,18 +49,16 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 	if mb.Timeout > 0 {
 		timeout = time.Now().Add(mb.Timeout)
 	}
-	if err = mb.conn.SetDeadline(timeout); err != nil {
+	if err = mb.tcpTransporter.SetDeadline(timeout); err != nil {
 		//slog.Error("Error setting deadline - connection may be broken", "error", err)
-		mb.tcpTransporter.close() // Close broken connection
 		return
 	}
 
 	// Send the request
 	mb.tcpTransporter.logf("modbus: sending % x\n", aduRequest)
-	if _, err = mb.conn.Write(aduRequest); err != nil {
+	if _, err = mb.tcpTransporter.Write(aduRequest); err != nil {
 		// Write errors usually indicate connection is broken
 		//slog.Error("Error writing request - connection broken", "error", err)
-		mb.tcpTransporter.close() // Close broken connection
 		return
 	}
 	function := aduRequest[1]
@@ -72,7 +70,7 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 	var data [rtuMaxSize]byte
 	//We first read the minimum length and then read either the full package
 	//or the error package, depending on the error status (byte 2 of the response)
-	n, err = io.ReadAtLeast(mb.conn, data[:], rtuMinSize)
+	n, err = io.ReadAtLeast(&mb.tcpTransporter, data[:], rtuMinSize)
 	if err != nil {
 		// Check if this is a timeout (slave might be slow) vs connection error
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -80,12 +78,12 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 			// Close connection to be safe (Modbus doesn't handle out-of-order responses well)
 			// Caller should retry with a new connection
 			//slog.Error("Read timeout - slave may be slow or packet lost", "error", err)
-			mb.tcpTransporter.close() // Close connection, caller should retry
+			// Connection already closed by Read wrapper
 			return
 		}
 		// Connection error: Connection is broken, must close
 		//slog.Error("Connection error during read", "error", err)
-		mb.tcpTransporter.close() // Close broken connection
+		// Connection already closed by Read wrapper
 		return
 	}
 	//if the function is correct
@@ -94,15 +92,9 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 		if n < bytesToRead {
 			if bytesToRead > rtuMinSize && bytesToRead <= rtuMaxSize {
 				if bytesToRead > n {
-					n1, err = io.ReadFull(mb.conn, data[n:bytesToRead])
+					n1, err = io.ReadFull(&mb.tcpTransporter, data[n:bytesToRead])
 					n += n1
 					if err != nil {
-						//	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						//		slog.Error("Read timeout while reading full response", "error", err)
-						// } else {
-						//	slog.Error("Connection error while reading full response", "error", err)
-						// }
-						mb.tcpTransporter.close() // Close broken connection
 						return
 					}
 				}
@@ -111,13 +103,8 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 	} else if data[1] == functionFail {
 		//for error we need to read 5 bytes
 		if n < rtuExceptionSize {
-			n1, err = io.ReadFull(mb.conn, data[n:rtuExceptionSize])
+			n1, err = io.ReadFull(&mb.tcpTransporter, data[n:rtuExceptionSize])
 			if err != nil {
-				//	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				//	slog.Error("Read timeout while reading exception response", "error", err)
-				// } else {
-				// 	slog.Error("Connection error while reading exception response", "error", err)
-				// }
 				mb.tcpTransporter.close() // Close broken connection
 				return
 			}
@@ -126,18 +113,9 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 	}
 
 	if err != nil {
-		//	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		//	slog.Error("Read timeout - slave may be slow", "error", err)
-		// } else {
-		//	slog.Error("Connection error", "error", err)
-		// }
-		mb.tcpTransporter.close() // Close broken connection
 		return
 	}
 	aduResponse = data[:n]
 	mb.logf("modbus: received % x\n", aduResponse)
-	// Update last activity after successful operation
-	mb.tcpTransporter.lastActivity = time.Now()
-	mb.tcpTransporter.startCloseTimer()
 	return
 }
