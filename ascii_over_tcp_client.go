@@ -47,15 +47,13 @@ func (mb *asciiTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err 
 	if mb.Timeout > 0 {
 		timeout = time.Now().Add(mb.Timeout)
 	}
-	if err = mb.conn.SetDeadline(timeout); err != nil {
-		mb.tcpTransporter.close() // Close broken connection
+	if err = mb.tcpTransporter.SetDeadline(timeout); err != nil {
 		return
 	}
 
 	// Send the request
 	mb.tcpTransporter.logf("modbus: sending %q\n", aduRequest)
-	if _, err = mb.conn.Write(aduRequest); err != nil {
-		mb.tcpTransporter.close() // Close broken connection
+	if _, err = mb.tcpTransporter.Write(aduRequest); err != nil {
 		return
 	}
 	// Get the response
@@ -63,8 +61,7 @@ func (mb *asciiTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err 
 	var data [asciiMaxSize]byte
 	length := 0
 	for {
-		if n, err = mb.conn.Read(data[length:]); err != nil {
-			mb.tcpTransporter.close() // Close broken connection
+		if n, err = mb.tcpTransporter.Read(data[length:]); err != nil {
 			return
 		}
 		length += n
@@ -80,8 +77,5 @@ func (mb *asciiTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err 
 	}
 	aduResponse = data[:length]
 	mb.tcpTransporter.logf("modbus: received %q\n", aduResponse)
-	// Update last activity after successful operation
-	mb.tcpTransporter.lastActivity = time.Now()
-	mb.tcpTransporter.startCloseTimer()
 	return
 }

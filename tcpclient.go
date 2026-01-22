@@ -196,6 +196,76 @@ type tcpTransporter struct {
 	lastActivity time.Time
 }
 
+// Write writes data to the connection and closes it on error.
+// Caller must hold the mutex.
+func (mb *tcpTransporter) Write(p []byte) (n int, err error) {
+	if mb.conn == nil {
+		return 0, io.ErrClosedPipe
+	}
+	n, err = mb.conn.Write(p)
+	if err != nil {
+		mb.close()
+	} else {
+		mb.refreshCloseTimer()
+	}
+	return n, err
+}
+
+// Read reads data from the connection and closes it on error.
+// Caller must hold the mutex.
+func (mb *tcpTransporter) Read(p []byte) (n int, err error) {
+	if mb.conn == nil {
+		return 0, io.ErrClosedPipe
+	}
+	n, err = mb.conn.Read(p)
+	if err != nil {
+		mb.close()
+	} else if n > 0 {
+		// Only refresh timer if we actually read data (not EOF)
+		mb.refreshCloseTimer()
+	}
+	return n, err
+}
+
+// SetDeadline sets the read and write deadlines and closes the connection on error.
+// Caller must hold the mutex.
+func (mb *tcpTransporter) SetDeadline(t time.Time) error {
+	if mb.conn == nil {
+		return io.ErrClosedPipe
+	}
+	err := mb.conn.SetDeadline(t)
+	if err != nil {
+		mb.close()
+	}
+	return err
+}
+
+// SetReadDeadline sets the read deadline and closes the connection on error.
+// Caller must hold the mutex.
+func (mb *tcpTransporter) SetReadDeadline(t time.Time) error {
+	if mb.conn == nil {
+		return io.ErrClosedPipe
+	}
+	err := mb.conn.SetReadDeadline(t)
+	if err != nil {
+		mb.close()
+	}
+	return err
+}
+
+// SetWriteDeadline sets the write deadline and closes the connection on error.
+// Caller must hold the mutex.
+func (mb *tcpTransporter) SetWriteDeadline(t time.Time) error {
+	if mb.conn == nil {
+		return io.ErrClosedPipe
+	}
+	err := mb.conn.SetWriteDeadline(t)
+	if err != nil {
+		mb.close()
+	}
+	return err
+}
+
 // Send sends data to server and ensures response length is greater than header length.
 func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error) {
 	mb.mu.Lock()
@@ -210,20 +280,17 @@ func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error
 	if mb.Timeout > 0 {
 		timeout = time.Now().Add(mb.Timeout)
 	}
-	if err = mb.conn.SetDeadline(timeout); err != nil {
-		mb.close() // Close broken connection
+	if err = mb.SetDeadline(timeout); err != nil {
 		return
 	}
 	// Send data
 	mb.logf("modbus: sending % x", aduRequest)
-	if _, err = mb.conn.Write(aduRequest); err != nil {
-		mb.close() // Close broken connection
+	if _, err = mb.Write(aduRequest); err != nil {
 		return
 	}
 	// Read header first
 	var data [tcpMaxLength]byte
-	if _, err = io.ReadFull(mb.conn, data[:tcpHeaderSize]); err != nil {
-		mb.close() // Close broken connection
+	if _, err = io.ReadFull(mb, data[:tcpHeaderSize]); err != nil {
 		return
 	}
 	// Read length, ignore transaction & protocol id (4 bytes)
@@ -245,15 +312,11 @@ func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error
 	}
 	// Skip unit id
 	length += tcpHeaderSize - 1
-	if _, err = io.ReadFull(mb.conn, data[tcpHeaderSize:length]); err != nil {
-		mb.close() // Close broken connection
+	if _, err = io.ReadFull(mb, data[tcpHeaderSize:length]); err != nil {
 		return
 	}
 	aduResponse = data[:length]
 	mb.logf("modbus: received % x\n", aduResponse)
-	// Update last activity after successful operation
-	mb.lastActivity = time.Now()
-	mb.startCloseTimer()
 	return
 }
 
@@ -297,6 +360,13 @@ func (mb *tcpTransporter) connect() error {
 	return nil
 }
 
+// refreshCloseTimer updates the last activity time and restarts the close timer.
+// Caller must hold the mutex.
+func (mb *tcpTransporter) refreshCloseTimer() {
+	mb.lastActivity = time.Now()
+	mb.startCloseTimer()
+}
+
 func (mb *tcpTransporter) startCloseTimer() {
 	if mb.IdleTimeout <= 0 {
 		return
@@ -319,11 +389,11 @@ func (mb *tcpTransporter) Close() error {
 // flush flushes pending data in the connection,
 // returns io.EOF if connection is closed.
 func (mb *tcpTransporter) flush(b []byte) (err error) {
-	if err = mb.conn.SetReadDeadline(time.Now()); err != nil {
+	if err = mb.SetReadDeadline(time.Now()); err != nil {
 		return
 	}
 	// Timeout setting will be reset when reading
-	if _, err = mb.conn.Read(b); err != nil {
+	if _, err = mb.Read(b); err != nil {
 		// Ignore timeout error
 		if netError, ok := err.(net.Error); ok && netError.Timeout() {
 			err = nil
