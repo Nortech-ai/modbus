@@ -357,6 +357,8 @@ func (mb *tcpTransporter) connect() error {
 		return err
 	}
 	mb.conn = conn
+	mb.lastActivity = time.Now()
+	mb.startCloseTimer()
 	return nil
 }
 

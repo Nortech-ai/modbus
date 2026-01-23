@@ -6,7 +6,6 @@ package modbus
 
 import (
 	"io"
-	"net"
 	"time"
 )
 
@@ -72,18 +71,7 @@ func (mb *rtuTCPTransporter) Send(aduRequest []byte) (aduResponse []byte, err er
 	//or the error package, depending on the error status (byte 2 of the response)
 	n, err = io.ReadAtLeast(&mb.tcpTransporter, data[:], rtuMinSize)
 	if err != nil {
-		// Check if this is a timeout (slave might be slow) vs connection error
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Timeout: Slave is slow or packet was lost, but connection might still be valid
-			// Close connection to be safe (Modbus doesn't handle out-of-order responses well)
-			// Caller should retry with a new connection
-			//slog.Error("Read timeout - slave may be slow or packet lost", "error", err)
-			// Connection already closed by Read wrapper
-			return
-		}
-		// Connection error: Connection is broken, must close
-		//slog.Error("Connection error during read", "error", err)
-		// Connection already closed by Read wrapper
+		// Read failed - Read() handles closing the connection
 		return
 	}
 	//if the function is correct
