@@ -316,16 +316,6 @@ func (h *ProxyTCPClientHandler) processFrames(ctx context.Context, frameBuffer *
 			break
 		}
 
-		// Validate CRC before forwarding to avoid propagating corrupted frames
-		if !h.rtuPackager.validateCRC(frame) {
-			log.Warn("Dropping RTU frame with invalid CRC, resyncing", "direction", direction, "frameLen", len(frame))
-			// Resync: we consumed a bad slice so the buffer may be mid-frame. Discard one byte and retry so we don't stall forever.
-			if len(*frameBuffer) > 0 {
-				*frameBuffer = (*frameBuffer)[1:]
-			}
-			continue
-		}
-
 		_, err := dst.Write(frame)
 		if err != nil {
 			log.Error("Error writing complete frame", "direction", direction, "error", err)
