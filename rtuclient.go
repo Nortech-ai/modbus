@@ -143,15 +143,19 @@ func (mb *rtuPackager) findFrameInBuffer(data []byte) int {
 		// Read Coils / Discrete Inputs / Holding Registers / Input Registers
 		// Request: 8 bytes [Slave][Func][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
 		// Response: [Slave][Func][Byte Count][Data...][CRCL][CRCH] = 5+byteCount
-		if len(data) >= 8 && len(data) < 9 {
-			return 8 // request (response is never 8 bytes: min 5+1=6, but 8 could be req or 5+3=8 resp; treat 8 as request)
+		// Prefer CRC-valid interpretation to avoid merging request+response (219-byte bug).
+		// If neither validates, return 8 anyway so we don't stall; processFrames will drop+resync if wrong.
+		if len(data) >= 8 && mb.validateCRC(data[:8]) {
+			return 8 // valid 8-byte frame (request or response with 3 data bytes)
 		}
-		if len(data) < 3 {
-			return 0
+		if len(data) >= 3 {
+			byteCount := int(data[2])
+			if byteCount <= 250 && len(data) >= 5+byteCount && mb.validateCRC(data[:5+byteCount]) {
+				return 5 + byteCount // response
+			}
 		}
-		byteCount := int(data[2])
-		if byteCount <= 250 && len(data) >= 5+byteCount {
-			return 5 + byteCount // response
+		if len(data) >= 8 {
+			return 8 // fallback: avoid stalling; proxy will validate in processFrames and resync if invalid
 		}
 		return 0
 	case 0x05, 0x06:
@@ -159,14 +163,20 @@ func (mb *rtuPackager) findFrameInBuffer(data []byte) int {
 		expectedLength = 8
 	case 0x0F, 0x10:
 		// Write multiple registers/coils: request has Byte Count at [6]; response is fixed 8 bytes
-		if len(data) >= 8 && len(data) < 9 {
+		// Prefer 8-byte (response) when CRC valid so we don't merge with next frame.
+		if len(data) >= 8 && mb.validateCRC(data[:8]) {
 			return 8 // Response: [Slave][Func][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
 		}
 		if len(data) < 7 {
-			return 0 // Need at least 7 bytes to read byte count for request
+			return 0
 		}
 		byteCount := int(data[6])
 		expectedLength = 9 + byteCount // 7 header bytes + data + 2 CRC bytes
+		if len(data) >= expectedLength {
+			return expectedLength
+		}
+		// Don't return 8 as fallback when we're mid-request (e.g. 01 10 00 00 00 69 d2 02 needs 219 bytes)
+		return 0
 	case 0x17:
 		// Read/Write Multiple Registers
 		// [Slave ID][Function Code][Read Address High][Read Address Low][Read Quantity High][Read Quantity Low][Write Address High][Write Address Low][Write Quantity High][Write Quantity Low][Write Byte Count][Write Data...][CRC Low][CRC High]
