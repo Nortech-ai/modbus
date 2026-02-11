@@ -29,9 +29,6 @@ type ProxyTCPClientHandler struct {
 	proxyCtx     context.Context
 	proxyCancel  context.CancelFunc
 	wg           sync.WaitGroup
-	// Frame reassembly buffers
-	remoteBuffer []byte
-	localBuffer  []byte
 }
 
 func NewProxyTCPClientHandler(proxyTargetAddress string, localAddress string) *ProxyTCPClientHandler {
@@ -140,9 +137,6 @@ func (h *ProxyTCPClientHandler) runProxy(ctx context.Context) {
 			h.remoteConn = nil
 		}
 		h.remoteConn = remoteConn
-		// Reset buffers to avoid forwarding stale/corrupt data across reconnections
-		h.remoteBuffer = nil
-		h.localBuffer = nil
 		h.mu.Unlock()
 
 		backoff = proxyReconnectBackoffInitial // reset on successful connection
@@ -251,16 +245,10 @@ func (h *ProxyTCPClientHandler) Close() error {
 	return h.TCPClientHandler.Close()
 }
 
+// forwardData copies bytes from src to dst without parsing frames.
+// Raw forwarding avoids any frame-boundary or CRC logic that could misalign the stream.
 func (h *ProxyTCPClientHandler) forwardData(ctx context.Context, src, dst net.Conn, direction string) {
 	buffer := make([]byte, 4096)
-	var frameBuffer *[]byte
-
-	if direction == "remote->local" {
-		frameBuffer = &h.remoteBuffer
-	} else {
-		frameBuffer = &h.localBuffer
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -270,13 +258,11 @@ func (h *ProxyTCPClientHandler) forwardData(ctx context.Context, src, dst net.Co
 		}
 
 		src.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-
 		n, err := src.Read(buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-
 			errStr := err.Error()
 			if strings.Contains(errStr, "use of closed network connection") ||
 				strings.Contains(errStr, "read: connection reset by peer") ||
@@ -284,46 +270,22 @@ func (h *ProxyTCPClientHandler) forwardData(ctx context.Context, src, dst net.Co
 				log.Info("Connection closed by partner", "direction", direction, "error", err)
 				return
 			}
-
 			if err != io.EOF {
 				log.Error("Error reading data", "direction", direction, "error", err)
 			}
 			return
 		}
-
 		if n > 0 {
-			// Refresh idle timer when reading from local so connection is not closed during proxy activity
 			if direction == "local->remote" {
 				h.TCPClientHandler.tcpTransporter.RefreshIdle()
 			}
-			*frameBuffer = append(*frameBuffer, buffer[:n]...)
-			h.processFrames(ctx, frameBuffer, dst, direction)
-		}
-	}
-}
-
-func (h *ProxyTCPClientHandler) processFrames(ctx context.Context, frameBuffer *[]byte, dst net.Conn, direction string) {
-	for len(*frameBuffer) > 0 {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		frame := make([]byte, 0)
-		h.rtuPackager.TryDecode(frameBuffer, &frame)
-		if len(frame) == 0 {
-			break
-		}
-
-		_, err := dst.Write(frame)
-		if err != nil {
-			log.Error("Error writing complete frame", "direction", direction, "error", err)
-			return
-		}
-		// Refresh idle timer when writing to local so connection is not closed during proxy activity
-		if direction == "remote->local" {
-			h.TCPClientHandler.tcpTransporter.RefreshIdle()
+			if _, err := dst.Write(buffer[:n]); err != nil {
+				log.Error("Error writing data", "direction", direction, "error", err)
+				return
+			}
+			if direction == "remote->local" {
+				h.TCPClientHandler.tcpTransporter.RefreshIdle()
+			}
 		}
 	}
 }
