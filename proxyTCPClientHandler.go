@@ -1,12 +1,18 @@
 package modbus
 
 import (
+	"context"
 	"io"
 	log "log/slog"
 	"net"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	proxyReconnectBackoffInitial = 1 * time.Second
+	proxyReconnectBackoffMax     = 30 * time.Second
 )
 
 type ProxyTCPClientHandler struct {
@@ -20,7 +26,8 @@ type ProxyTCPClientHandler struct {
 	mu           sync.Mutex
 	remoteConn   net.Conn
 	proxyRunning bool
-	stopChan     chan struct{}
+	proxyCtx     context.Context
+	proxyCancel  context.CancelFunc
 	wg           sync.WaitGroup
 	// Frame reassembly buffers
 	remoteBuffer []byte
@@ -31,7 +38,6 @@ func NewProxyTCPClientHandler(proxyTargetAddress string, localAddress string) *P
 	handler := &ProxyTCPClientHandler{
 		TCPClientHandler:   TCPClientHandler{},
 		proxyTargetAddress: proxyTargetAddress,
-		stopChan:           make(chan struct{}),
 	}
 	// Set the local address for the embedded TCPClientHandler
 	handler.TCPClientHandler.tcpTransporter.Address = localAddress
@@ -54,22 +60,23 @@ func (h *ProxyTCPClientHandler) Send(aduRequest []byte) (aduResponse []byte, err
 }
 
 func (h *ProxyTCPClientHandler) StartProxy() error {
-	// Connect to the remote target
-	remoteConn, err := net.Dial("tcp", h.proxyTargetAddress)
-	if err != nil {
-		return err
-	}
-	h.remoteConn = remoteConn
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
-	// Start the proxy forwarding goroutine
+	// Create new context for this proxy run (allows restart after Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	h.proxyCtx = ctx
+	h.proxyCancel = cancel
+
+	// Start the proxy forwarding goroutine (it will connect inside the loop)
 	h.proxyRunning = true
 	h.wg.Add(1)
-	go h.runProxy()
+	go h.runProxy(ctx)
 
 	return nil
 }
 
-func (h *ProxyTCPClientHandler) runProxy() {
+func (h *ProxyTCPClientHandler) runProxy(ctx context.Context) {
 	defer h.wg.Done()
 	defer func() {
 		h.mu.Lock()
@@ -81,43 +88,133 @@ func (h *ProxyTCPClientHandler) runProxy() {
 		h.mu.Unlock()
 	}()
 
-	// Get the local connection from the TCP client handler
-	h.mu.Lock()
-	localConn := h.TCPClientHandler.tcpTransporter.conn
-	h.mu.Unlock()
+	backoff := proxyReconnectBackoffInitial
 
-	if localConn == nil {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("Stopping TCP proxy (shutdown)")
+			return
+		default:
+		}
+
+		// Ensure local connection exists
+		h.mu.Lock()
+		h.TCPClientHandler.tcpTransporter.mu.Lock()
+		err := h.TCPClientHandler.tcpTransporter.connect()
+		h.TCPClientHandler.tcpTransporter.mu.Unlock()
+		h.mu.Unlock()
+
+		if err != nil {
+			log.Warn("Proxy failed to connect to local", "error", err)
+			h.sleepOrExit(ctx, backoff)
+			backoff = h.nextBackoff(backoff)
+			continue
+		}
+
+		h.mu.Lock()
+		localConn := h.TCPClientHandler.tcpTransporter.conn
+		h.mu.Unlock()
+
+		if localConn == nil {
+			h.sleepOrExit(ctx, backoff)
+			backoff = h.nextBackoff(backoff)
+			continue
+		}
+
+		// Connect to remote
+		remoteConn, err := net.Dial("tcp", h.proxyTargetAddress)
+		if err != nil {
+			log.Warn("Proxy failed to connect to remote", "address", h.proxyTargetAddress, "error", err)
+			h.TCPClientHandler.tcpTransporter.mu.Lock()
+			h.TCPClientHandler.tcpTransporter.close()
+			h.TCPClientHandler.tcpTransporter.mu.Unlock()
+			h.sleepOrExit(ctx, backoff)
+			backoff = h.nextBackoff(backoff)
+			continue
+		}
+
+		h.mu.Lock()
+		if h.remoteConn != nil {
+			h.remoteConn.Close()
+			h.remoteConn = nil
+		}
+		h.remoteConn = remoteConn
+		// Reset buffers to avoid forwarding stale/corrupt data across reconnections
+		h.remoteBuffer = nil
+		h.localBuffer = nil
+		h.mu.Unlock()
+
+		backoff = proxyReconnectBackoffInitial // reset on successful connection
+
+		done := make(chan struct{}, 2)
+
+		// Forward data from localhost to remote
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			defer func() { done <- struct{}{} }()
+			h.forwardData(ctx, localConn, remoteConn, "local->remote")
+		}()
+
+		// Forward data from remote to localhost
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			defer func() { done <- struct{}{} }()
+			h.forwardData(ctx, remoteConn, localConn, "remote->local")
+		}()
+
+		// Wait for either direction to finish or shutdown
+		select {
+		case <-done:
+			// One direction failed: close both connections so the other goroutine exits
+			h.mu.Lock()
+			if h.remoteConn != nil {
+				h.remoteConn.Close()
+				h.remoteConn = nil
+			}
+			h.mu.Unlock()
+			h.TCPClientHandler.tcpTransporter.mu.Lock()
+			h.TCPClientHandler.tcpTransporter.close()
+			h.TCPClientHandler.tcpTransporter.mu.Unlock()
+			// Wait for the other goroutine to notice and exit
+			<-done
+			log.Info("Proxy connection lost, reconnecting", "backoff", backoff)
+			h.sleepOrExit(ctx, backoff)
+			backoff = h.nextBackoff(backoff)
+		case <-ctx.Done():
+			// Close connections so forwardData goroutines exit
+			h.mu.Lock()
+			if h.remoteConn != nil {
+				h.remoteConn.Close()
+				h.remoteConn = nil
+			}
+			h.mu.Unlock()
+			h.TCPClientHandler.tcpTransporter.mu.Lock()
+			h.TCPClientHandler.tcpTransporter.close()
+			h.TCPClientHandler.tcpTransporter.mu.Unlock()
+			<-done
+			<-done
+			return
+		}
+	}
+}
+
+func (h *ProxyTCPClientHandler) sleepOrExit(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-t.C:
 		return
 	}
+}
 
-	// Create channels for coordination
-	done := make(chan struct{}, 2)
-
-	// Forward data from localhost:1502 to remote
-	h.wg.Add(1)
-	go func() {
-		defer h.wg.Done()
-		defer func() { done <- struct{}{} }()
-		h.forwardData(localConn, h.remoteConn, "local->remote")
-		//io.Copy(h.remoteConn, localConn)
-	}()
-
-	// Forward data from remote to localhost:1502
-	h.wg.Add(1)
-	go func() {
-		defer h.wg.Done()
-		defer func() { done <- struct{}{} }()
-		h.forwardData(h.remoteConn, localConn, "remote->local")
-		//io.Copy(localConn, h.remoteConn)
-	}()
-
-	// Wait for either direction to finish or stop signal
-	select {
-	case <-done:
-		// One direction finished, stop the other
-	case <-h.stopChan:
-		// Stop signal received
-	}
+func (h *ProxyTCPClientHandler) nextBackoff(current time.Duration) time.Duration {
+	next := min(current*2, proxyReconnectBackoffMax)
+	return next
 }
 
 func (h *ProxyTCPClientHandler) Connect() error {
@@ -130,18 +227,19 @@ func (h *ProxyTCPClientHandler) Connect() error {
 
 func (h *ProxyTCPClientHandler) Close() error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Stop the proxy
-	if h.proxyRunning {
-		close(h.stopChan)
-		h.proxyRunning = false
-
-		// Wait for proxy goroutines to finish
-		h.mu.Unlock()
-		h.wg.Wait()
-		h.mu.Lock()
+	if h.proxyCancel != nil {
+		h.proxyCancel()
+		h.proxyCancel = nil
 	}
+	proxyRunning := h.proxyRunning
+	h.mu.Unlock()
+
+	if proxyRunning {
+		h.wg.Wait()
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	// Close remote connection
 	if h.remoteConn != nil {
@@ -153,12 +251,10 @@ func (h *ProxyTCPClientHandler) Close() error {
 	return h.TCPClientHandler.Close()
 }
 
-func (h *ProxyTCPClientHandler) forwardData(src, dst net.Conn, direction string) {
-
+func (h *ProxyTCPClientHandler) forwardData(ctx context.Context, src, dst net.Conn, direction string) {
 	buffer := make([]byte, 4096)
 	var frameBuffer *[]byte
 
-	// Choose the appropriate buffer based on direction
 	if direction == "remote->local" {
 		frameBuffer = &h.remoteBuffer
 	} else {
@@ -166,27 +262,21 @@ func (h *ProxyTCPClientHandler) forwardData(src, dst net.Conn, direction string)
 	}
 
 	for {
-		// Check for shutdown signal first
 		select {
-		case <-h.stopChan:
+		case <-ctx.Done():
 			log.Info("Stopping TCP proxy", "direction", direction)
 			return
 		default:
 		}
 
-		// Set read deadline to allow periodic shutdown checks
 		src.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 
 		n, err := src.Read(buffer)
 		if err != nil {
-			// Check if it's a timeout error (expected for periodic doneCh checks)
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Timeout is expected, continue to check doneCh
 				continue
 			}
 
-			// Check for "use of closed network connection" and similar connection errors. If so return
-			// by cleaning up
 			errStr := err.Error()
 			if strings.Contains(errStr, "use of closed network connection") ||
 				strings.Contains(errStr, "read: connection reset by peer") ||
@@ -197,34 +287,49 @@ func (h *ProxyTCPClientHandler) forwardData(src, dst net.Conn, direction string)
 
 			if err != io.EOF {
 				log.Error("Error reading data", "direction", direction, "error", err)
-
 			}
 			return
 		}
 
 		if n > 0 {
-			// Add to frame buffer
+			// Refresh idle timer when reading from local so connection is not closed during proxy activity
+			if direction == "local->remote" {
+				h.TCPClientHandler.tcpTransporter.RefreshIdle()
+			}
 			*frameBuffer = append(*frameBuffer, buffer[:n]...)
-
-			// Process complete frames
-			h.processFrames(frameBuffer, dst, direction)
+			h.processFrames(ctx, frameBuffer, dst, direction)
 		}
 	}
 }
 
-func (h *ProxyTCPClientHandler) processFrames(frameBuffer *[]byte, dst net.Conn, direction string) {
+func (h *ProxyTCPClientHandler) processFrames(ctx context.Context, frameBuffer *[]byte, dst net.Conn, direction string) {
 	for len(*frameBuffer) > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		frame := make([]byte, 0)
 		h.rtuPackager.TryDecode(frameBuffer, &frame)
 		if len(frame) == 0 {
 			break
 		}
 
-		// Write the complete frame to the destination
+		// Validate CRC before forwarding to avoid propagating corrupted frames
+		if !h.rtuPackager.validateCRC(frame) {
+			log.Warn("Dropping RTU frame with invalid CRC", "direction", direction, "frameLen", len(frame))
+			continue
+		}
+
 		_, err := dst.Write(frame)
 		if err != nil {
 			log.Error("Error writing complete frame", "direction", direction, "error", err)
 			return
+		}
+		// Refresh idle timer when writing to local so connection is not closed during proxy activity
+		if direction == "remote->local" {
+			h.TCPClientHandler.tcpTransporter.RefreshIdle()
 		}
 	}
 }

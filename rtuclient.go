@@ -139,15 +139,31 @@ func (mb *rtuPackager) findFrameInBuffer(data []byte) int {
 	var expectedLength int
 
 	switch functionCode {
-	case 0x01, 0x02, 0x03, 0x04, 0x05, 0x06:
-		// Read/Write single register/coil functions
-		// [Slave ID][Function Code][Address High][Address Low][Value High][Value Low][CRC Low][CRC High]
+	case 0x01, 0x02, 0x03, 0x04:
+		// Read Coils / Discrete Inputs / Holding Registers / Input Registers
+		// Request: 8 bytes [Slave][Func][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
+		// Response: [Slave][Func][Byte Count][Data...][CRCL][CRCH] = 5+byteCount
+		if len(data) >= 8 && len(data) < 9 {
+			return 8 // request (response is never 8 bytes: min 5+1=6, but 8 could be req or 5+3=8 resp; treat 8 as request)
+		}
+		if len(data) < 3 {
+			return 0
+		}
+		byteCount := int(data[2])
+		if byteCount <= 250 && len(data) >= 5+byteCount {
+			return 5 + byteCount // response
+		}
+		return 0
+	case 0x05, 0x06:
+		// Write single coil/register: request and response both 8 bytes
 		expectedLength = 8
 	case 0x0F, 0x10:
-		// Write multiple registers/coils
-		// [Slave ID][Function Code][Address High][Address Low][Quantity High][Quantity Low][Byte Count][Data...][CRC Low][CRC High]
-		if len(data) < 6 {
-			return 0 // Need at least 6 bytes to determine length
+		// Write multiple registers/coils: request has Byte Count at [6]; response is fixed 8 bytes
+		if len(data) >= 8 && len(data) < 9 {
+			return 8 // Response: [Slave][Func][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
+		}
+		if len(data) < 7 {
+			return 0 // Need at least 7 bytes to read byte count for request
 		}
 		byteCount := int(data[6])
 		expectedLength = 9 + byteCount // 7 header bytes + data + 2 CRC bytes

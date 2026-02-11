@@ -369,6 +369,14 @@ func (mb *tcpTransporter) refreshCloseTimer() {
 	mb.startCloseTimer()
 }
 
+// RefreshIdle updates the last activity time and restarts the idle close timer.
+// Safe to call from other goroutines (e.g. proxy forwarding).
+func (mb *tcpTransporter) RefreshIdle() {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	mb.refreshCloseTimer()
+}
+
 func (mb *tcpTransporter) startCloseTimer() {
 	if mb.IdleTimeout <= 0 {
 		return
