@@ -5,14 +5,20 @@ import (
 	"io"
 	log "log/slog"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jellydator/ttlcache/v3"
 )
 
 const (
 	proxyReconnectBackoffInitial = 1 * time.Second
 	proxyReconnectBackoffMax     = 30 * time.Second
+	// Resync buffer limits: max total bytes across fragments, TTL per fragment
+	maxResyncBufferSize = 65536
+	resyncBufferTTL     = 30 * time.Second
 )
 
 type ProxyTCPClientHandler struct {
@@ -123,9 +129,7 @@ func (h *ProxyTCPClientHandler) runProxy(ctx context.Context) {
 		remoteConn, err := net.Dial("tcp", h.proxyTargetAddress)
 		if err != nil {
 			log.Warn("Proxy failed to connect to remote", "address", h.proxyTargetAddress, "error", err)
-			h.TCPClientHandler.tcpTransporter.mu.Lock()
-			h.TCPClientHandler.tcpTransporter.close()
-			h.TCPClientHandler.tcpTransporter.mu.Unlock()
+			h.closeConnections()
 			h.sleepOrExit(ctx, backoff)
 			backoff = h.nextBackoff(backoff)
 			continue
@@ -163,15 +167,7 @@ func (h *ProxyTCPClientHandler) runProxy(ctx context.Context) {
 		select {
 		case <-done:
 			// One direction failed: close both connections so the other goroutine exits
-			h.mu.Lock()
-			if h.remoteConn != nil {
-				h.remoteConn.Close()
-				h.remoteConn = nil
-			}
-			h.mu.Unlock()
-			h.TCPClientHandler.tcpTransporter.mu.Lock()
-			h.TCPClientHandler.tcpTransporter.close()
-			h.TCPClientHandler.tcpTransporter.mu.Unlock()
+			h.closeConnections()
 			// Wait for the other goroutine to notice and exit
 			<-done
 			log.Info("Proxy connection lost, reconnecting", "backoff", backoff)
@@ -179,15 +175,7 @@ func (h *ProxyTCPClientHandler) runProxy(ctx context.Context) {
 			backoff = h.nextBackoff(backoff)
 		case <-ctx.Done():
 			// Close connections so forwardData goroutines exit
-			h.mu.Lock()
-			if h.remoteConn != nil {
-				h.remoteConn.Close()
-				h.remoteConn = nil
-			}
-			h.mu.Unlock()
-			h.TCPClientHandler.tcpTransporter.mu.Lock()
-			h.TCPClientHandler.tcpTransporter.close()
-			h.TCPClientHandler.tcpTransporter.mu.Unlock()
+			h.closeConnections()
 			<-done
 			<-done
 			return
@@ -209,6 +197,20 @@ func (h *ProxyTCPClientHandler) sleepOrExit(ctx context.Context, d time.Duration
 func (h *ProxyTCPClientHandler) nextBackoff(current time.Duration) time.Duration {
 	next := min(current*2, proxyReconnectBackoffMax)
 	return next
+}
+
+// closeConnections closes the remote connection (if any) and the local tcpTransporter.
+// Caller must not hold h.mu or tcpTransporter.mu.
+func (h *ProxyTCPClientHandler) closeConnections() {
+	h.mu.Lock()
+	if h.remoteConn != nil {
+		h.remoteConn.Close()
+		h.remoteConn = nil
+	}
+	h.mu.Unlock()
+	h.TCPClientHandler.tcpTransporter.mu.Lock()
+	h.TCPClientHandler.tcpTransporter.close()
+	h.TCPClientHandler.tcpTransporter.mu.Unlock()
 }
 
 func (h *ProxyTCPClientHandler) Connect() error {
@@ -245,10 +247,17 @@ func (h *ProxyTCPClientHandler) Close() error {
 	return h.TCPClientHandler.Close()
 }
 
-// forwardData copies bytes from src to dst without parsing frames.
-// Raw forwarding avoids any frame-boundary or CRC logic that could misalign the stream.
+// forwardData copies bytes from src to dst.
+// For remote->local we resync on start: buffer until we have one complete RTU frame with valid CRC,
+// then write it and switch to raw passthrough. That way we never forward a leading partial frame
+// (e.g. after reconnect) which would cause CRC errors in the connector.
 func (h *ProxyTCPClientHandler) forwardData(ctx context.Context, src, dst net.Conn, direction string) {
-	buffer := make([]byte, 4096)
+	readBuf := make([]byte, 4096)
+	if direction == "remote->local" {
+		h.forwardRemoteToLocalResync(ctx, src, dst, readBuf)
+		return
+	}
+	// local->remote: raw passthrough
 	for {
 		select {
 		case <-ctx.Done():
@@ -256,9 +265,8 @@ func (h *ProxyTCPClientHandler) forwardData(ctx context.Context, src, dst net.Co
 			return
 		default:
 		}
-
 		src.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		n, err := src.Read(buffer)
+		n, err := src.Read(readBuf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
@@ -276,16 +284,166 @@ func (h *ProxyTCPClientHandler) forwardData(ctx context.Context, src, dst net.Co
 			return
 		}
 		if n > 0 {
-			if direction == "local->remote" {
-				h.TCPClientHandler.tcpTransporter.RefreshIdle()
-			}
-			if _, err := dst.Write(buffer[:n]); err != nil {
+			h.TCPClientHandler.tcpTransporter.RefreshIdle()
+			if _, err := dst.Write(readBuf[:n]); err != nil {
 				log.Error("Error writing data", "direction", direction, "error", err)
 				return
 			}
-			if direction == "remote->local" {
-				h.TCPClientHandler.tcpTransporter.RefreshIdle()
+		}
+	}
+}
+
+// forwardRemoteToLocalResync buffers TCP fragments with TTL and max size, builds a contiguous
+// buffer in order, and forwards only complete CRC-valid Modbus RTU frames. Consumed bytes
+// (garbage + frame) are removed from fragment storage; remainder stays for next iteration.
+func (h *ProxyTCPClientHandler) forwardRemoteToLocalResync(ctx context.Context, src, dst net.Conn, readBuf []byte) {
+	fragmentsCache := ttlcache.New(
+		ttlcache.WithTTL[uint64, []byte](resyncBufferTTL),
+		ttlcache.WithMaxCost[uint64, []byte](maxResyncBufferSize, func(item ttlcache.CostItem[uint64, []byte]) uint64 {
+			return uint64(len(item.Value))
+		}),
+	)
+	defer fragmentsCache.Stop()
+	go fragmentsCache.Start()
+
+	var nextSeq uint64
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("Stopping TCP proxy", "direction", "remote->local")
+			return
+		default:
+		}
+		src.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, err := src.Read(readBuf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			errStr := err.Error()
+			if strings.Contains(errStr, "use of closed network connection") ||
+				strings.Contains(errStr, "read: connection reset by peer") ||
+				strings.Contains(errStr, "broken pipe") {
+				log.Info("Connection closed by partner", "direction", "remote->local", "error", err)
+				return
+			}
+			if err != io.EOF {
+				log.Error("Error reading data", "direction", "remote->local", "error", err)
+			}
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		h.TCPClientHandler.tcpTransporter.RefreshIdle()
+
+		h.evictOldestFragmentsUntilUnderLimit(fragmentsCache, maxResyncBufferSize-n)
+		nextSeq++
+		fragCopy := make([]byte, n)
+		copy(fragCopy, readBuf[:n])
+		fragmentsCache.Set(nextSeq, fragCopy, resyncBufferTTL)
+
+		resyncBuf := h.buildBufferFromFragments(fragmentsCache)
+		for len(resyncBuf) >= 2 {
+			found := false
+			for offset := 0; offset <= len(resyncBuf)-2; offset++ {
+				bufSlice := resyncBuf[offset:]
+				var frame []byte
+				h.rtuPackager.TryDecode(&bufSlice, &frame)
+				if len(frame) == 0 {
+					continue
+				}
+				if h.rtuPackager.validateCRC(frame) {
+					if _, err := dst.Write(frame); err != nil {
+						log.Error("Error writing data", "direction", "remote->local", "error", err)
+						return
+					}
+					h.consumeFromFragments(fragmentsCache, offset+len(frame))
+					found = true
+					break
+				}
+			}
+			if !found {
+				break
+			}
+			resyncBuf = h.buildBufferFromFragments(fragmentsCache)
+		}
+	}
+}
+
+// evictOldestFragmentsUntilUnderLimit deletes fragments with smallest keys until total bytes <= maxBytes.
+func (h *ProxyTCPClientHandler) evictOldestFragmentsUntilUnderLimit(cache *ttlcache.Cache[uint64, []byte], maxBytes int) {
+	for {
+		keys := cache.Keys()
+		if len(keys) == 0 {
+			return
+		}
+		slices.Sort(keys)
+		var total int
+		for _, k := range keys {
+			item := cache.Get(k, ttlcache.WithDisableTouchOnHit[uint64, []byte]())
+			if item != nil && !item.IsExpired() {
+				total += len(item.Value())
 			}
 		}
+		if total <= maxBytes {
+			return
+		}
+		for _, k := range keys {
+			item := cache.Get(k, ttlcache.WithDisableTouchOnHit[uint64, []byte]())
+			if item != nil && !item.IsExpired() {
+				cache.Delete(k)
+				break
+			}
+		}
+	}
+}
+
+// buildBufferFromFragments concatenates all non-expired fragments in key order.
+func (h *ProxyTCPClientHandler) buildBufferFromFragments(cache *ttlcache.Cache[uint64, []byte]) []byte {
+	keys := cache.Keys()
+	slices.Sort(keys)
+	var buf []byte
+	for _, k := range keys {
+		item := cache.Get(k, ttlcache.WithDisableTouchOnHit[uint64, []byte]())
+		if item == nil || item.IsExpired() {
+			continue
+		}
+		buf = append(buf, item.Value()...)
+	}
+	return buf
+}
+
+// consumeFromFragments removes the first bytesToRemove bytes from the fragment cache by
+// deleting fully consumed fragments and trimming the fragment that spans the boundary.
+func (h *ProxyTCPClientHandler) consumeFromFragments(cache *ttlcache.Cache[uint64, []byte], bytesToRemove int) {
+	if bytesToRemove <= 0 {
+		return
+	}
+	keys := cache.Keys()
+	slices.Sort(keys)
+	for _, k := range keys {
+		item := cache.Get(k, ttlcache.WithDisableTouchOnHit[uint64, []byte]())
+		if item == nil || item.IsExpired() {
+			continue
+		}
+		v := item.Value()
+		fragLen := len(v)
+		if bytesToRemove >= fragLen {
+			cache.Delete(k)
+			bytesToRemove -= fragLen
+			if bytesToRemove == 0 {
+				return
+			}
+			continue
+		}
+		trimmed := make([]byte, fragLen-bytesToRemove)
+		copy(trimmed, v[bytesToRemove:])
+		ttl := time.Until(item.ExpiresAt())
+		if ttl <= 0 {
+			ttl = resyncBufferTTL
+		}
+		cache.Set(k, trimmed, ttl)
+		return
 	}
 }

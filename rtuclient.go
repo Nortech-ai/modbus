@@ -159,22 +159,37 @@ func (mb *rtuPackager) findFrameInBuffer(data []byte) int {
 		expectedLength = 8
 	case 0x0F, 0x10:
 		// Write multiple registers/coils: request has Byte Count at [6]; response is fixed 8 bytes
-		if len(data) >= 8 && len(data) < 9 {
+		// When 9+ bytes, data[6] could be CRCL of an 8-byte response (not request byte count).
+		// Prefer 8-byte response when the first 8 bytes have valid CRC to avoid merging with next frame.
+		if len(data) >= 8 && mb.validateCRC(data[:8]) {
 			return 8 // Response: [Slave][Func][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
 		}
 		if len(data) < 7 {
 			return 0
 		}
 		byteCount := int(data[6])
+		if byteCount > 246 {
+			return 0
+		}
 		expectedLength = 9 + byteCount // 7 header bytes + data + 2 CRC bytes
 	case 0x17:
 		// Read/Write Multiple Registers
-		// [Slave ID][Function Code][Read Address High][Read Address Low][Read Quantity High][Read Quantity Low][Write Address High][Write Address Low][Write Quantity High][Write Quantity Low][Write Byte Count][Write Data...][CRC Low][CRC High]
+		// Request: [Slave][Func][ReadAddrH][ReadAddrL][ReadQtyH][ReadQtyL][WriteAddrH][WriteAddrL][WriteQtyH][WriteQtyL][WriteByteCount][WriteData...][CRCL][CRCH]
+		// Response: [Slave][Func][ReadByteCount][ReadData...][CRCL][CRCH]
+		if len(data) >= 3 {
+			readByteCount := int(data[2])
+			if readByteCount <= 250 && len(data) >= 5+readByteCount {
+				return 5 + readByteCount // response
+			}
+		}
 		if len(data) < 12 {
-			return 0 // Need at least 12 bytes to determine length
+			return 0
 		}
 		writeByteCount := int(data[11])
-		expectedLength = 13 + writeByteCount // 12 header bytes + data + 2 CRC bytes
+		if writeByteCount > 246 {
+			return 0
+		}
+		expectedLength = 13 + writeByteCount // request
 	default:
 		// For unknown function codes, try to find frame boundary by looking for valid CRC
 		// This is a fallback method
