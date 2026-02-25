@@ -357,6 +357,8 @@ func (mb *tcpTransporter) connect() error {
 		return err
 	}
 	mb.conn = conn
+	mb.lastActivity = time.Now()
+	mb.startCloseTimer()
 	return nil
 }
 
@@ -365,6 +367,14 @@ func (mb *tcpTransporter) connect() error {
 func (mb *tcpTransporter) refreshCloseTimer() {
 	mb.lastActivity = time.Now()
 	mb.startCloseTimer()
+}
+
+// RefreshIdle updates the last activity time and restarts the idle close timer.
+// Safe to call from other goroutines (e.g. proxy forwarding).
+func (mb *tcpTransporter) RefreshIdle() {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	mb.refreshCloseTimer()
 }
 
 func (mb *tcpTransporter) startCloseTimer() {
