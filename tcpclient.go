@@ -160,19 +160,33 @@ func (mb *tcpPackager) Verify(aduRequest []byte, aduResponse []byte) (err error)
 //	Protocol identifier: 2 bytes
 //	Length: 2 bytes
 //	Unit identifier: 1 byte
+//
+// Validation is relaxed to accept real-world captures: the frame must have at least
+// unit ID + function code (2 bytes after header), and at least as many bytes as the
+// MBAP length field indicates. Extra trailing bytes are allowed (e.g. padding).
 func (mb *tcpPackager) Decode(adu []byte) (pdu *ProtocolDataUnit, err error) {
-	// Read length value in the header
-	length := binary.BigEndian.Uint16(adu[4:])
 	pduLength := len(adu) - tcpHeaderSize
-	if pduLength <= 0 || pduLength != int(length-1) {
-		return pdu, &ModbusTCPError{
+	if len(adu) < tcpHeaderSize+2 {
+		resp := pduLength
+		if resp < 0 {
+			resp = 0
+		}
+		return nil, &ModbusTCPError{
+			ExceptionCode: ExceptionCodeWrongSize,
+			Request:       2,
+			Response:      resp,
+		}
+	}
+	length := binary.BigEndian.Uint16(adu[4:])
+	// Require at least unit ID + function code; require at least as many bytes as header says (no truncation)
+	if pduLength < 2 || pduLength < int(length-1) {
+		return nil, &ModbusTCPError{
 			ExceptionCode: ExceptionCodeWrongSize,
 			Request:       length - 1,
 			Response:      pduLength,
 		}
 	}
 	pdu = &ProtocolDataUnit{}
-	// The first byte after header is function code
 	pdu.FunctionCode = adu[tcpHeaderSize]
 	pdu.Data = adu[tcpHeaderSize+1:]
 	return
